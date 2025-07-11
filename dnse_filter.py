@@ -1,13 +1,13 @@
 import json
 import os
+import hashlib
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 from kafka import KafkaConsumer, KafkaProducer
 import time
 from dotenv import load_dotenv
 
 load_dotenv()
-
 
 STOCK_OHLC_PATTERN = "plaintext/quotes/krx/mdds/v2/ohlc"
 STOCK_TOP_PRICE_PATTERN = "plaintext/quotes/krx/mdds/topprice"
@@ -15,6 +15,35 @@ STOCK_TICK_PATTERN = "plaintext/quotes/krx/mdds/tick"
 STOCK_INFO_PATTERN = "plaintext/quotes/krx/mdds/stockinfo"
 STOCK_MARKET_INDEX_PATTERN = "plaintext/quotes/krx/mdds/index"
 STOCK_BOARD_EVENT_PATTERN = "plaintext/quotes/krx/mdds/boardevent"
+
+
+def calculate_message_checksum(message: Dict[str, Any], algorithm: str = "sha256") -> str:
+    try:
+        message_copy = {k: v for k, v in message.items() if k != 'checksum'}
+        message_str = json.dumps(message_copy, sort_keys=True, default=str)
+        
+        if algorithm.lower() == "md5":
+            hash_obj = hashlib.md5()
+        elif algorithm.lower() == "sha1":
+            hash_obj = hashlib.sha1()
+        else:
+            hash_obj = hashlib.sha256()
+        
+        hash_obj.update(message_str.encode('utf-8'))
+        return hash_obj.hexdigest()
+        
+    except Exception as e:
+        print(f"Error calculating checksum: {e}")
+        return ""
+
+
+def verify_message_checksum(message: Dict[str, Any], algorithm: str = "sha256") -> bool:
+    stored_checksum = message.get('checksum', '')
+    if not stored_checksum:
+        return False
+    
+    calculated_checksum = calculate_message_checksum(message, algorithm)
+    return stored_checksum == calculated_checksum
 
 
 def get_dnse_time_i_to_i(t) -> int:
@@ -234,8 +263,12 @@ def run_transform_pipeline():
     input_topic = 'dnse.raw'
     output_topic = 'dnse.transform'
     group_id = 'dnse.transform.pipeline'
+    checksum_algorithm = os.getenv('CHECKSUM_ALGORITHM', 'sha256').lower()
+    enable_checksum_verification = os.getenv('ENABLE_CHECKSUM_VERIFICATION', 'false').lower() == 'true'
     
     print(f"Starting Transform Pipeline: Kafka '{input_topic}' -> transform -> Kafka '{output_topic}'")
+    print(f"Checksum Algorithm: {checksum_algorithm}")
+    print(f"Checksum Verification: {'Enabled' if enable_checksum_verification else 'Disabled'}")
     
     try:
         consumer = KafkaConsumer(
@@ -267,6 +300,9 @@ def run_transform_pipeline():
     
     processed = 0
     transformed_count = 0
+    checksum_count = 0
+    duplicates = 0
+    seen_checksums: Set[str] = set()
     
     try:
         print("Starting message processing...")
@@ -275,10 +311,29 @@ def run_transform_pipeline():
                 key = message.key or ''
                 value = message.value or {}
                 
+                input_checksum = value.get('checksum', '')
+                if input_checksum and input_checksum in seen_checksums:
+                    duplicates += 1
+                    symbol = value.get('symbol', 'UNKNOWN')
+                    print(f"Duplicate input detected: {symbol} - Checksum: {input_checksum[:8]}")
+                    continue
+                
+                if input_checksum:
+                    seen_checksums.add(input_checksum)
+                
                 transformed_list = filter_transform(key, value)
                 
                 for transformed in transformed_list:
                     try:
+                        checksum = calculate_message_checksum(transformed, algorithm=checksum_algorithm)
+                        transformed['checksum'] = checksum
+                        
+                        if enable_checksum_verification:
+                            is_valid = verify_message_checksum(transformed, algorithm=checksum_algorithm)
+                            if not is_valid:
+                                print(f"Warning: Checksum verification failed for message")
+                                continue
+                        
                         msg_key = transformed.get('symbol', '')
                         
                         future = producer.send(
@@ -289,9 +344,12 @@ def run_transform_pipeline():
                         
                         data_type = transformed.get('data_type', 'UNKNOWN')
                         symbol = transformed.get('symbol', 'UNKNOWN')
-                        print(f"Transformed: {data_type} - {symbol}")
+                        checksum_short = checksum[:8] if checksum else "NONE"
+                        print(f"Transformed: {data_type} - {symbol} - Checksum: {checksum_short}")
                         
                         transformed_count += 1
+                        if checksum:
+                            checksum_count += 1
                         
                     except Exception as e:
                         print(f"Error sending transformed message: {e}")
@@ -299,7 +357,7 @@ def run_transform_pipeline():
                 processed += 1
                 
                 if processed % 100 == 0:
-                    print(f"Processed {processed} messages, transformed {transformed_count} outputs")
+                    print(f"Processed {processed} messages, transformed {transformed_count} outputs, checksums added: {checksum_count}, duplicates: {duplicates}")
                 
             except Exception as e:
                 print(f"Error processing message: {e}")
@@ -309,7 +367,7 @@ def run_transform_pipeline():
     finally:
         consumer.close()
         producer.close()
-        print(f"Transform pipeline completed. Processed: {processed}, Transformed: {transformed_count}")
+        print(f"Transform pipeline completed. Processed: {processed}, Transformed: {transformed_count}, Checksums: {checksum_count}, Duplicates: {duplicates}")
 
 
 if __name__ == "__main__":
